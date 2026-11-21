@@ -210,6 +210,9 @@ def render_and_extract(page, today: dt.date) -> dict:
     from playwright.sync_api import TimeoutError as PWTimeout
     try:
         page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
+        print("[debug] URL:", page.url, flush=True)
+        print("[debug] TITLE:", page.title(), flush=True)
+        print("[debug] BODY:", page.locator("body").inner_text()[:1500], flush=True)
         head = (page.content()[:4000] if page.content() else "")
         if any(m in head for m in CF_MARKERS):
             raise RuntimeError("cloudflare")
@@ -220,7 +223,8 @@ def render_and_extract(page, today: dt.date) -> dict:
             timeout=45_000,
         )
         page.wait_for_function(
-            "() => document.body.innerText.includes('F-1')", timeout=20_000
+            "() => document.body.innerText.includes('H-1B')",
+            timeout=20_000
         )
         return page.evaluate(EXTRACT_JS)
     except PWTimeout:
