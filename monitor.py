@@ -303,6 +303,80 @@ def _new_page(browser):
 
 
 
+
+def _safe_endpoint(raw: str) -> str:
+    """Log only an origin and redacted path; never log tokens or URL queries."""
+    try:
+        u = urllib.parse.urlsplit(raw)
+        if u.scheme not in ('http', 'https', 'ws', 'wss'):
+            return 'other-scheme'
+        parts = []
+        for part in u.path.split('/'):
+            # Dynamic path components may contain bearer tokens, IDs, or emails.
+            if '@' in part or len(part) > 42 or re.search(r'[A-Za-z0-9_-]{24,}', part):
+                part = ':redacted'
+            parts.append(part)
+        return f'{u.scheme}://{u.netloc}' + '/'.join(parts)
+    except Exception:
+        return 'unparseable-endpoint'
+
+
+def _diagnostic_snapshot(page, events: dict) -> None:
+    """Only page *structure* and network metadata, never booking records/PII.
+
+    The previous code printed the body text of qmq.app, which is a misleading
+    source of homepage booking-success dates. This report avoids that entirely.
+    """
+    try:
+        state = page.evaluate(r"""() => {
+          const clean = t => (t || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+          const matches = t => /可用日期|预约日历|面签日历|实时日历|查号|号源|空位|签证|预约|calendar|availability|slot/i.test(t);
+          const visible = e => !!e.getClientRects().length &&
+            getComputedStyle(e).visibility !== 'hidden';
+          const body = document.body?.innerText || '';
+          const gather = (selector, limit = 18) =>
+            [...document.querySelectorAll(selector)].filter(visible)
+              .map(e => clean(e.innerText || e.textContent))
+              .filter(t => t && matches(t)).slice(0, limit);
+          const anchor = [...document.querySelectorAll('a[href]')]
+            .filter(visible).map(e => ({label: clean(e.innerText),
+              href: e.getAttribute('href') || ''}))
+            .filter(x => matches(x.label)).slice(0, 15);
+          const cities = ['广州','北京','上海','沈阳','武汉'];
+          return {
+            title: document.title, html_bytes: document.documentElement?.outerHTML.length || 0,
+            visible_text_chars: body.length,
+            document_ready_state: document.readyState,
+            city_name_mentions_in_whole_page: Object.fromEntries(cities.map(c =>
+              [c, (body.match(new RegExp(c, 'g')) || []).length])),
+            has_count_labels: /\d[\d,]*\s*个可用日期/.test(body),
+            has_calendar_words: /可用日期|预约日历|面签日历|calendar|availability/i.test(body),
+            has_success_feed: /最近抢位成功|抢位成功记录|最近成功/i.test(body),
+            h1b_mentions_in_whole_page: (body.match(/H-1B|H1B/gi)||[]).length,
+            matched_headings: gather('h1,h2,h3,h4,h5,[role="heading"]'),
+            matched_buttons_tabs: gather('button,[role="button"],[role="tab"]'),
+            matched_links: anchor,
+            iframe_count: document.querySelectorAll('iframe').length,
+            script_count: document.querySelectorAll('script').length
+          };
+        }""")
+        # A link may contain tokens or customer-specific query strings. Redact it.
+        for item in state.get('matched_links', []):
+            href = item.pop('href', '')
+            item['path'] = _safe_endpoint(urllib.parse.urljoin(page.url, href))
+        print('[diagnostic] page_structure=' + json.dumps(state, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print('[diagnostic] page_structure_unavailable=' + type(exc).__name__, flush=True)
+    print('[diagnostic] transport=' + json.dumps(events, ensure_ascii=False), flush=True)
+    if os.environ.get('VISA_DIAG_SCREENSHOT', '') == '1':
+        try:
+            dest = Path('qmq_failure.png')
+            page.screenshot(path=str(dest), full_page=True, timeout=10_000)
+            print('[diagnostic] screenshot_saved=' + str(dest), flush=True)
+        except Exception as exc:
+            print('[diagnostic] screenshot_failed=' + type(exc).__name__, flush=True)
+
+
 def render_and_extract(page, today: dt.date) -> dict:
     """Find the real availability calendar, never infer dates from homepage news.
 
@@ -311,6 +385,34 @@ def render_and_extract(page, today: dt.date) -> dict:
     the old hard-coded 'N个可用日期' button selector.
     """
     from playwright.sync_api import TimeoutError as PWTimeout
+
+    # Keep a bounded record of network *metadata*, never bodies or query params.
+    events = {'xhr_fetch': [], 'failed_requests': [], 'websockets': [], 'js_errors': []}
+    def on_response(response):
+        try:
+            kind = response.request.resource_type
+            if kind in ('xhr', 'fetch', 'document') and len(events['xhr_fetch']) < 30:
+                events['xhr_fetch'].append({
+                    'type': kind, 'status': response.status,
+                    'endpoint': _safe_endpoint(response.url)})
+        except Exception:
+            pass
+    def on_requestfailed(request):
+        if len(events['failed_requests']) < 15:
+            events['failed_requests'].append({
+                'type': request.resource_type,
+                'endpoint': _safe_endpoint(request.url)})
+    def on_websocket(ws):
+        if len(events['websockets']) < 10:
+            events['websockets'].append(_safe_endpoint(ws.url))
+    def on_pageerror(exc):
+        if len(events['js_errors']) < 8:
+            # Don't log an exception message: it might embed an auth token.
+            events['js_errors'].append(type(exc).__name__)
+    listeners = [('response', on_response), ('requestfailed', on_requestfailed),
+                 ('websocket', on_websocket), ('pageerror', on_pageerror)]
+    for event, callback in listeners:
+        page.on(event, callback)
 
     try:
         response = page.goto(URL, wait_until="domcontentloaded", timeout=45_000)
@@ -364,10 +466,16 @@ def render_and_extract(page, today: dt.date) -> dict:
         missing = [c for c in CITIES if c not in present]
         print(f'[debug] Calendar unavailable; recognized cities={present}, missing={missing}, '
               f'reason={result.get("error", last_error)}', flush=True)
+        _diagnostic_snapshot(page, events)
         raise RuntimeError(f'calendar-unavailable ({last_error}; '
                            f'parsed {len(present)}/{len(CITIES)} cities)')
     except PWTimeout as exc:
+        _diagnostic_snapshot(page, events)
         raise RuntimeError(f'page-navigation-or-render-timeout ({str(exc).splitlines()[0]})') from exc
+    finally:
+        for event, callback in listeners:
+            page.remove_listener(event, callback)
+
 
 
 def scrape(today: dt.date) -> dict:
