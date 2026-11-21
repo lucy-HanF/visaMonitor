@@ -7,8 +7,11 @@ five Mainland China consulates and sends a phone push (via ntfy.sh) when an
 appointment date on/before the configured cutoff appears. Remembers what it already alerted so you are not notified twice
 for the same date.
 
-The source may render its appointment calendar client-side. This monitor
-only trusts identifiable, city-specific H-1B listings in the rendered DOM;
+The source may render its appointment calendar client-side, sometimes behind
+human image verification. For local semi-automatic use, run --manual-check and
+complete that challenge yourself in the visible browser. Scheduled CI never
+attempts to solve or circumvent image verification.
+This monitor only trusts identifiable, city-specific H-1B listings in the rendered DOM;
 a homepage containing only global booking successes is an explicit scrape
 failure, not evidence of available appointments.
 
@@ -495,7 +498,38 @@ def _calendar_ui_diagnostic(page, stage: str) -> None:
               type(exc).__name__, flush=True)
 
 
-def render_and_extract(page, today: dt.date) -> dict:
+def _verification_diagnostic(page) -> dict:
+    """Inspect visible verification UI without reading image contents or solving it.
+
+    This only reports observable structural cues; presence of reCAPTCHA scripts
+    alone is NOT proof that a challenge is currently blocking the page.
+    """
+    try:
+        return page.evaluate(r"""() => {
+          const visible = e => {
+            if (!e || !e.getClientRects().length) return false;
+            const s = getComputedStyle(e);
+            return s.display !== 'none' && s.visibility !== 'hidden' &&
+                   Number(s.opacity || 1) > 0;
+          };
+          const key = /请.{0,8}(?:点击|选择).{0,10}(?:图片|图中|图案)|点击.{0,10}(?:图片|图中)|人机验证|图形验证|图片验证|点选验证|安全验证|完成验证|验证码|verify you are human|select.*images|captcha/i;
+          const dialogs = [...document.querySelectorAll('[role="dialog"],dialog,[aria-modal="true"]')]
+            .filter(visible);
+          const overlays = [...document.querySelectorAll('[class*="captcha" i],[id*="captcha" i],[class*="geetest" i],[id*="geetest" i],[class*="verify" i],[id*="verify" i]')]
+            .filter(visible);
+          const candidate = [...new Set([...dialogs, ...overlays])];
+          const explicit = candidate.some(e => key.test((e.innerText || '').slice(0, 400)));
+          const visibleImageCount = candidate.reduce((n,e) => n + e.querySelectorAll('img,canvas').length, 0);
+          return {required: explicit, visible_dialog_count: dialogs.length,
+                  visible_verification_elements: overlays.length,
+                  verification_image_elements: visibleImageCount,
+                  evidence: explicit ? 'visible-verification-text' : 'not-confirmed'};
+        }""")
+    except Exception:
+        return {'required': False, 'evidence': 'diagnostic-unavailable'}
+
+
+def render_and_extract(page, today: dt.date, *, navigate: bool = True, auto_entry: bool = True) -> dict:
     """Find the real availability calendar, never infer dates from homepage news.
 
     Uses multiple DOM layouts and (optionally) follows a discovered calendar tab.
@@ -533,11 +567,15 @@ def render_and_extract(page, today: dt.date) -> dict:
         page.on(event, callback)
 
     try:
-        response = page.goto(URL, wait_until="domcontentloaded", timeout=45_000)
-        status = response.status if response else None
-        print(f"[debug] HTTP {status}; URL: {page.url}", flush=True)
-        if status is not None and status >= 400:
-            raise RuntimeError(f"http-{status}")
+        if navigate:
+            response = page.goto(URL, wait_until="domcontentloaded", timeout=45_000)
+            status = response.status if response else None
+            print(f"[debug] HTTP {status}; URL: {page.url}", flush=True)
+            if status is not None and status >= 400:
+                raise RuntimeError(f"http-{status}")
+        else:
+            # The user navigated and completed the image verification by hand.
+            print(f'[debug] Reading manually verified browser page: {page.url}', flush=True)
         body = page.locator('body').inner_text(timeout=10_000)
         if any(x.lower() in body.lower() for x in CF_MARKERS):
             raise RuntimeError('cloudflare')
@@ -548,10 +586,23 @@ def render_and_extract(page, today: dt.date) -> dict:
         result = page.evaluate(EXTRACT_JS, CITIES)
         entry = 'unneeded'
         if result.get('error') or len(result.get('cities', [])) != len(CITIES):
-            entry = _click_calendar_entry(page)
-            if entry.startswith('clicked:'):
-                page.wait_for_timeout(900)
-                _calendar_ui_diagnostic(page, 'after_entry')
+            challenge = _verification_diagnostic(page)
+            if challenge.get('required') and auto_entry:
+                print('[diagnostic] verification=' + json.dumps(challenge, ensure_ascii=False), flush=True)
+                raise RuntimeError('manual-image-verification-required (GitHub Actions cannot complete it)')
+            if auto_entry:
+                entry = _click_calendar_entry(page)
+                if entry.startswith('clicked:'):
+                    page.wait_for_timeout(900)
+                    _calendar_ui_diagnostic(page, 'after_entry')
+                else:
+                    # A timed-out click often signals a verification dialog.
+                    challenge = _verification_diagnostic(page)
+                    print('[diagnostic] verification=' + json.dumps(challenge, ensure_ascii=False), flush=True)
+                    if challenge.get('required'):
+                        raise RuntimeError('manual-image-verification-required (GitHub Actions cannot complete it)')
+            else:
+                entry = 'manual-verified-browser'
 
         # The calendar may show country selection before city/visa rows.
         country_attempts = 0
@@ -568,9 +619,13 @@ def render_and_extract(page, today: dt.date) -> dict:
                       flush=True)
                 return result
             last_error = result.get('error', 'missing-city-panels')
+            challenge = _verification_diagnostic(page)
+            if challenge.get('required'):
+                print('[diagnostic] verification=' + json.dumps(challenge, ensure_ascii=False), flush=True)
+                raise RuntimeError('manual-image-verification-required (GitHub Actions cannot complete it)')
 
             # Country controls may mount asynchronously after the entry click.
-            if (entry.startswith('clicked:') and not country_selected
+            if (auto_entry and entry.startswith('clicked:') and not country_selected
                     and country_attempts < 5 and time.monotonic() >= next_country_attempt):
                 country_attempts += 1
                 country_selected = _select_cn_country(page)
@@ -1025,6 +1080,42 @@ def run_check(emergency: str = EMG_EXCLUDE, page=None) -> int:
     return 0
 
 
+def run_manual_check() -> int:
+    """Local only: let a person complete qmq.app image verification in a browser.
+
+    This does not automate, bypass, outsource or reuse a CAPTCHA solution.
+    It is deliberately unsuitable for unattended GitHub Actions scheduling.
+    """
+    from playwright.sync_api import sync_playwright
+    if not sys.stdin.isatty():
+        print('STATUS: MANUAL_CHECK_REQUIRES_TERMINAL -- run on your local desktop', flush=True)
+        return 2
+    with sync_playwright() as p:
+        browser = p.chromium.launch(headless=False)
+        try:
+            page = _new_page(browser)
+            page.goto(URL, wait_until='domcontentloaded', timeout=45_000)
+            print('\n[manual] 在弹出的浏览器中：')
+            print('  1. 亲自完成网站要求的图片点击验证。')
+            print('  2. 打开「查看可预约面签位」，进入中国五领区预约日历。')
+            print('  3. 等待 H-1B 预约信息加载（不要使用首页抢位成功记录）。')
+            input('[manual] 日历加载完成后，回到终端按 Enter 读取：')
+            try:
+                data = render_and_extract(page, current_today(), navigate=False, auto_entry=False)
+                validate_snapshot(data)
+            except Exception as exc:
+                print(f'[manual] STATUS: SCRAPE_FAILED ({exc})', flush=True)
+                return 1
+            title, body = build_status(data, EMG_EXCLUDE)
+            print('\n' + title + '\n' + body, flush=True)
+            # Explicitly requested manual status, same non-urgent notification as --check.
+            if NTFY_TOPIC:
+                push(title, body, priority='default')
+            return 0
+        finally:
+            browser.close()
+
+
 def run_once() -> int:
     try:
         data = scrape(current_today())
@@ -1128,6 +1219,8 @@ def run_watch(interval: int, recycle: int = 40) -> int:
 def main() -> None:
     ap = argparse.ArgumentParser(description="visaMonitor -- US visa appointment availability monitor")
     ap.add_argument("--once", action="store_true", help="check a single time and exit (default)")
+    ap.add_argument("--manual-check", action="store_true",
+                    help="local headed browser: manually complete image verification, then read H-1B status")
     ap.add_argument("--watch", nargs="?", type=int, const=60, metavar="SECONDS",
                     help="stay running, re-check every SECONDS (default 60, min 20); "
                          "near real-time, needs an always-on machine")
@@ -1145,6 +1238,9 @@ def main() -> None:
              f"Monitoring {VISA_PREFIX} [{DESC_CONTAINS}] in {'/'.join(CITIES)} for dates by {CUTOFF}.")
         print("test push sent (if VISA_NTFY_TOPIC set)")
         return
+
+    if args.manual_check:
+        sys.exit(run_manual_check())
 
     if args.check:
         sys.exit(run_check(emergency=EMG_ONLY if args.emergency else EMG_EXCLUDE))
