@@ -2,14 +2,15 @@
 """
 visaMonitor -- US visa appointment availability monitor.
 
-Watches the live availability grid on https://qmq.app for given cities + visa
-type and sends a phone push (via ntfy.sh) when an appointment date on/before a
-cutoff appears. Remembers what it already alerted so you are not notified twice
+Watches the public H-1B availability calendar on https://qmq.app for the
+five Mainland China consulates and sends a phone push (via ntfy.sh) when an
+appointment date on/before the configured cutoff appears. Remembers what it already alerted so you are not notified twice
 for the same date.
 
-The grid on qmq.app is rendered client-side over a Supabase Realtime (Phoenix)
-websocket -- there is no JSON API and the raw HTML is empty -- so we render the
-page with a headless browser and read the DOM.
+The source may render its appointment calendar client-side. This monitor
+only trusts identifiable, city-specific H-1B listings in the rendered DOM;
+a homepage containing only global booking successes is an explicit scrape
+failure, not evidence of available appointments.
 
 Config is via environment variables (see CONFIG below) with sensible defaults.
 Run `python3 monitor.py --once` to check a single time (used by the scheduler).
@@ -29,6 +30,7 @@ import time
 import urllib.parse
 import urllib.request
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 # --------------------------------------------------------------------------- #
 # Config (override with env vars, all prefixed VISA_)
@@ -47,22 +49,14 @@ def _env(name: str, default: str = "", legacy: str = "") -> str:
     return default
 
 
-# Consulate cities to watch (Chinese names as shown on the site), comma-separated.
-# Default = the 5 China cities, which all load on the default view.
-_cities = _env("CITIES") or os.environ.get("QMQ_CITY", "") or "广州,北京,上海,沈阳,武汉"
-CITIES = [c.strip() for c in _cities.split(",") if c.strip()]
-VISA_PREFIX = _env("TYPE", "F-1", legacy="VISA")     # matches any row whose badge starts with this (F-1 = all F-1 subcategories)
-DESC_CONTAINS = _env("DESC").strip()                 # narrow by row description substring, case-insensitive; "" (default) = all sub-categories
-# Per-city override of that filter: "城市=值" pairs, comma-separated.
-# Value "ALL" (or empty) means: no narrowing for that city -- watch every
-# sub-category of VISA_TYPE there, while every other city keeps whatever
-# VISA_DESC says. e.g. "上海=ALL" or "上海=All Students,北京=Graduate".
+# This deployment is intentionally H-1B-only and Mainland-China-only.
+# Ignore a stale/incorrect repo variable rather than silently watching F-1 or HK.
+CITIES = ["广州", "北京", "上海", "沈阳", "武汉"]
+VISA_PREFIX = "H-1B"
+# Match every H-1B subcategory. Ignore legacy VISA_DESC / DESC_BY_CITY
+# values that may have been configured for an older F-1 monitor.
+DESC_CONTAINS = ""
 DESC_BY_CITY: dict[str, str] = {}
-for _pair in _env("DESC_BY_CITY").split(","):
-    if "=" in _pair:
-        _c, _, _d = _pair.partition("=")
-        _d = _d.strip()
-        DESC_BY_CITY[_c.strip()] = "" if _d.upper() in ("ALL", "*", "") else _d
 # Alert on dates ON OR BEFORE this (inclusive, ISO yyyy-mm-dd).
 # No meaningful default is possible, so fall back to "60 days out" -- set
 # VISA_CUTOFF to your real target date.
@@ -99,62 +93,164 @@ STATE_FILE = Path(_env("STATE") or Path(__file__).with_name("state.json"))
 HISTORY_FILE = Path(_env("HISTORY") or Path(__file__).with_name("history.jsonl"))
 _today = _env("TODAY")
 TODAY = dt.date.fromisoformat(_today) if _today else dt.date.today()
+
+
+def current_today() -> dt.date:
+    """Use calendar date in China's time zone; rollover during long --watch runs."""
+    return TODAY if _today else dt.datetime.now(ZoneInfo("Asia/Shanghai")).date()
+
+
 URL = "https://qmq.app"
 
 # --------------------------------------------------------------------------- #
-# DOM extraction -- runs inside the rendered page, returns ALL visible city
-# cards as JSON: { cities: [{ city, count, rows:[{badge,desc,status,dates}] }] }.
-# The grid's innerText is a flat sequence of city sections; each begins with a
-# "<city>" name line followed by an "<N> 个可用日期" count line, then visa rows:
-#   [badge, description, status(有位/紧缺), "N前更新", date-chips(月日 + weekday)...]
-# Chips are sorted earliest-first, so the earliest date shows even when collapsed.
+# DOM extraction: only trust CITY-ANCHORED availability panels. The "recent
+# successful bookings" activity feed is NOT an appointment calendar.
+# The extractor deliberately fails closed if no identifiable calendar exists.
 # --------------------------------------------------------------------------- #
 EXTRACT_JS = r"""
-() => {
-  const btns = Array.from(document.querySelectorAll('button'));
-  const cityBtns = btns.filter(b => /\d[\d,]*\s*个可用日期/.test(b.textContent));
-  if (!cityBtns.length) return { error: 'no-city-cards' };
-  // Walk up to the smallest container that holds every city card.
-  const markers = el => (el.innerText.match(/个可用日期/g) || []).length;
-  let box = cityBtns[0];
-  while (box.parentElement && markers(box) < cityBtns.length) box = box.parentElement;
-  const lines = box.innerText.split('\n').map(s => s.trim()).filter(Boolean);
+(citiesWanted) => {
+  const CITY_NAMES = citiesWanted;
+  const citySet = new Set(CITY_NAMES);
+  const COUNT = /(?:\d[\d,]*\s*个可用日期|可用日期\s*[:：]?\s*\d[\d,]*|暂无可用日期|无可用日期|\d[\d,]*\s*available dates?)/i;
+  const GRID_WORD = /可用日期|可预约日期|预约日历|面签日历|available dates?/i;
+  const BADGE = /^(?:B1\/B2|B1|B2|F-1|F-2|J-1|H-1B|H1B|H-4|L-1|L-2|K-1|O-1|C1\/D|F1)(?=$|\s|[：:|•])/i;
+  const DATE = /(?:20\d{2}[-\/.]\d{1,2}[-\/.]\d{1,2}|20\d{2}年\d{1,2}月\d{1,2}日|\d{1,2}月\d{1,2}日)/g;
+  const UPDATED = /(刚刚|\d+\s*(?:秒|分钟|小时|天)前)更新/;
+  const EMERGENCY = /官方紧急申请|不是普通号|emergency[- ]only/i;
+  const STOP = /^(?:最近抢位成功|最新抢位成功|抢位成功记录|最近成功记录|成功案例|常见问题|FAQ|用户评价|新闻动态|最新动态)/;
+  const normalize = s => (s || '').replace(/\u00a0/g, ' ').replace(/\s+/g, ' ').trim();
+  const visible = e => {
+    if (!e || !e.isConnected) return false;
+    const style = getComputedStyle(e);
+    return style.display !== 'none' && style.visibility !== 'hidden';
+  };
+  const text = e => (e && e.innerText) || '';
+  const linesOf = s => (s || '').split(/\n+/).map(normalize).filter(Boolean);
+  const cleanCity = s => CITY_NAMES.find(c => s === c || s.startsWith(c + ' ') || s.startsWith(c + '：') || s.startsWith(c + ':')) || null;
+  const distinctCities = s => CITY_NAMES.filter(c => new RegExp('(?:^|\\n)\\s*' + c + '(?=\\s|$|[:：])').test(s));
 
-  const BADGE = /^(B1|B1\/B2|B2|F-1|F-2|H-1B|H-4|J-1|L-1|L-2|K-1|O-1|C1\/D|F1)$/;
-  const DESCK = /(Visa|Student|Crew|Waiver|Others|specialty|professionals|Exchange)/i;
-  const COUNT = /^(\D*?)(\d[\d,]*)\s*个可用日期$/;
-  const EMERG = /官方紧急申请|不是普通号/;  // emergency-only slot tag
-  const UPD   = /(刚刚|\d+\s*(秒|分钟|小时|天)前)更新$/;  // how stale qmq's own data is
+  function parseRows(raw) {
+    const ls = linesOf(raw);
+    const heads = [];
+    for (let i = 0; i < ls.length; i++) {
+      const m = ls[i].match(BADGE);
+      if (m) {
+        const badge = m[0].replace(/H1B/i, 'H-1B').trim();
+        // Old cards often render the badge and description on consecutive
+        // lines: "H-1B" / "H-1B Visa ...". They form ONE row, not two.
+        if (heads.length && heads[heads.length - 1].i === i - 1 &&
+            ls[i - 1].trim().toUpperCase() === badge.toUpperCase() &&
+            ls[i].length > badge.length && ls[i].slice(badge.length).trim()) {
+          continue;
+        }
+        heads.push({i, badge});
+      }
+    }
+    const rows = [];
+    for (let k = 0; k < heads.length; k++) {
+      const h = heads[k];
+      if (h.badge.toUpperCase() !== 'H-1B') continue;
+      const part = ls.slice(h.i, k + 1 < heads.length ? heads[k + 1].i : ls.length);
+      let desc = part[0].replace(BADGE, '').replace(/^[\s:：|•-]+/, '').trim();
+      if (!desc && part[1] && !/(?:20\d{2}[-\/.]\d{1,2}[-\/.]\d{1,2}|\d{1,2}月\d{1,2}日)/.test(part[1]) &&
+          !/^(有位|紧缺|暂无|无位)$/.test(part[1])) desc = part[1];
+      DATE.lastIndex = 0;
+      const dates = [];
+      for (const line of part) {
+        // Skip update timestamps; accept only appointment-date-shaped labels.
+        if (/前更新/.test(line)) continue;
+        for (const m of line.matchAll(DATE)) dates.push(m[0]);
+      }
+      const status = part.find(x => /^(?:有位|紧缺|暂无|无位)$/.test(x)) || '?';
+      rows.push({badge: 'H-1B', desc: desc || 'H-1B', status,
+                 emergency: part.some(x => EMERGENCY.test(x)),
+                 updated: part.find(x => UPDATED.test(x)) || '',
+                 dates: [...new Set(dates)]});
+    }
+    return rows;
+  }
 
-  // City sections start at each "count" line; city name is on that line or the one before.
-  const secs = [];
-  for (let i = 0; i < lines.length; i++) {
-    const m = lines[i].match(COUNT);
-    if (m) {
-      const city = (m[1].trim()) || (lines[i - 1] || '?').trim();
-      secs.push({ city, count: m[2], start: i + 1 });
+  // Strategy A: find individually scoped city cards via calendar/count nodes.
+  // Don't use document.body's entire text; it also contains a global activity feed.
+  const cards = new Map();
+  const candidates = [...document.querySelectorAll('button, [role="button"], h1, h2, h3, h4, div, section, article, span')]
+    .filter(visible).filter(e => {
+      const own = normalize(text(e));
+      return own.length < 180 && COUNT.test(own);
+    });
+  for (const el of candidates) {
+    let best = null;
+    for (let cur = el, depth = 0; cur && depth < 7; cur = cur.parentElement, depth++) {
+      const t = text(cur);
+      if (t.length > 16000) break;
+      const cities = distinctCities(t);
+      // If two city headers appear, the container is no longer a single city card.
+      if (cities.length > 1) break;
+      if (cities.length === 1 && COUNT.test(t) && BADGE.test(linesOf(t).find(l => BADGE.test(l)) || '')) {
+        best = {city: cities[0], element: cur};
+        break;
+      }
+    }
+    if (best && !cards.has(best.city)) cards.set(best.city, best.element);
+  }
+
+  // Strategy B: revised UI may put city panels under named headings without a
+  // count button. Require a nearby calendar marker and a typed visa listing.
+  if (cards.size < CITY_NAMES.length) {
+    const headings = [...document.querySelectorAll('h1,h2,h3,h4,h5,[role="heading"],button,[role="tab"]')].filter(visible);
+    for (const heading of headings) {
+      const city = cleanCity(normalize(text(heading)));
+      if (!city || cards.has(city)) continue;
+      for (let cur = heading.parentElement, depth = 0; cur && depth < 5; cur = cur.parentElement, depth++) {
+        const t = text(cur);
+        if (t.length > 16000 || distinctCities(t).length > 1) break;
+        const ls = linesOf(t);
+        if (GRID_WORD.test(t) && ls.some(l => BADGE.test(l)) &&
+            (ls.some(l => /H-1B|H1B/.test(l)) || COUNT.test(t))) {
+          cards.set(city, cur);
+          break;
+        }
+      }
     }
   }
-  const parseRows = seg => {
-    const heads = [];
-    for (let i = 0; i < seg.length - 1; i++) {
-      if (BADGE.test(seg[i]) && DESCK.test(seg[i + 1] || '')) heads.push({ i, badge: seg[i], desc: seg[i + 1] });
+
+  // Strategy C: legacy flat city grid with consecutive '<N> 个可用日期'
+  // separators. This is accepted only if the count markers are present.
+  if (cards.size < CITY_NAMES.length) {
+    const source = text(document.querySelector('main') || document.body);
+    const ls = linesOf(source);
+    const starts = [];
+    for (let i = 0; i < ls.length; i++) {
+      if (!COUNT.test(ls[i])) continue;
+      const city = cleanCity(ls[i]) || cleanCity(ls[i - 1] || '');
+      if (city && citySet.has(city)) starts.push({city, i});
     }
-    return heads.map((h, k) => {
-      const end = k + 1 < heads.length ? heads[k + 1].i : seg.length;
-      const part = seg.slice(h.i, end);
-      const status = part.find(s => s === '有位' || s === '紧缺') || '?';
-      const emergency = part.some(s => EMERG.test(s));
-      const updated = (part.find(s => UPD.test(s)) || '');
-      const dates = part.filter(s => /^\d{1,2}月\d{1,2}日$/.test(s));
-      return { badge: h.badge, desc: h.desc, status, emergency, updated, dates };
-    });
-  };
-  const cities = secs.map((s, k) => {
-    const end = k + 1 < secs.length ? secs[k + 1].start - 1 : lines.length;  // drop next city's name line
-    return { city: s.city, count: s.count, rows: parseRows(lines.slice(s.start, end)) };
+    // Require at least two independently marked city sections to rule out a
+    // single advertisement, user activity entry, or booking confirmation.
+    if (starts.length >= 2) {
+      starts.forEach((start, k) => {
+        if (cards.has(start.city)) return;
+        const end = k + 1 < starts.length ? starts[k + 1].i - 1 : ls.length;
+        const seg = ls.slice(start.i + 1, end);
+        const stopAt = seg.findIndex(x => STOP.test(x));
+        const section = (stopAt >= 0 ? seg.slice(0, stopAt) : seg).join('\n');
+        cards.set(start.city, {innerText: section});
+      });
+    }
+  }
+
+  const cities = CITY_NAMES.filter(c => cards.has(c)).map(city => {
+    const raw = text(cards.get(city));
+    const firstLines = linesOf(raw).slice(0, 5).join(' ');
+    const count = firstLines.match(/(\d[\d,]*)\s*个可用日期|可用日期\s*[:：]?\s*(\d[\d,]*)/);
+    return {city, count: count ? (count[1] || count[2]) : '', rows: parseRows(raw)};
   });
-  return { cities };
+  const rowCount = cities.reduce((n, c) => n + c.rows.length, 0);
+  if (!cities.length) return {error: 'city-calendar-not-found', cities: []};
+  if (!rowCount && !(cities.length === CITY_NAMES.length &&
+                     cities.every(c => c.count.replace(/,/g, '') === '0')))
+    return {error: 'h1b-rows-not-found', cities};
+  return {cities};
 }
 """
 
@@ -177,13 +273,19 @@ def parse_age_minutes(txt: str):
 
 
 def parse_cn_date(chip: str, today: dt.date) -> dt.date:
-    """'8月11日' -> date. Year inferred: if month < today's month, it's next year."""
-    m = re.match(r"(\d{1,2})月(\d{1,2})日", chip)
+    """Parse calendar chips; never treat past dates as available appointments."""
+    s = chip.strip()
+    iso = re.fullmatch(r"(20\d{2})[-/.](\d{1,2})[-/.](\d{1,2})", s)
+    full_cn = re.fullmatch(r"(20\d{2})年(\d{1,2})月(\d{1,2})日", s)
+    if iso or full_cn:
+        y, m, d = map(int, (iso or full_cn).groups())
+        return dt.date(y, m, d)
+    m = re.fullmatch(r"(\d{1,2})月(\d{1,2})日", s)
     if not m:
         raise ValueError(chip)
-    month, day = int(m.group(1)), int(m.group(2))
-    year = today.year if month >= today.month else today.year + 1
-    return dt.date(year, month, day)
+    month, day = map(int, m.groups())
+    candidate = dt.date(today.year, month, day)
+    return candidate if candidate >= today else dt.date(today.year + 1, month, day)
 
 
 CF_MARKERS = ("Just a moment", "cf-browser-verification", "Attention Required",
@@ -202,82 +304,70 @@ def _new_page(browser):
 
 
 def render_and_extract(page, today: dt.date) -> dict:
-    """Load qmq.app, wait for its city grid, and extract visible data."""
+    """Find the real availability calendar, never infer dates from homepage news.
+
+    Uses multiple DOM layouts and (optionally) follows a discovered calendar tab.
+    If no calendar is published, fail explicitly instead of waiting forever on
+    the old hard-coded 'N个可用日期' button selector.
+    """
     from playwright.sync_api import TimeoutError as PWTimeout
 
-    stage = "navigation"
-
     try:
-        started = time.monotonic()
-        print("[debug] Opening:", URL, flush=True)
+        response = page.goto(URL, wait_until="domcontentloaded", timeout=45_000)
+        status = response.status if response else None
+        print(f"[debug] HTTP {status}; URL: {page.url}", flush=True)
+        if status is not None and status >= 400:
+            raise RuntimeError(f"http-{status}")
+        body = page.locator('body').inner_text(timeout=10_000)
+        if any(x.lower() in body.lower() for x in CF_MARKERS):
+            raise RuntimeError('cloudflare')
 
-        response = page.goto(
-            URL,
-            wait_until="domcontentloaded",
-            timeout=60_000,
-        )
+        # The old grid may now live under a "日历" tab / link. We ONLY click a
+        # link with an explicit calendar label; never click checkout/order/login.
+        clicked_calendar = False
+        deadline = time.monotonic() + 28
+        last_error = 'city-calendar-not-found'
+        while time.monotonic() < deadline:
+            result = page.evaluate(EXTRACT_JS, CITIES)
+            if not result.get('error') and len(result.get('cities', [])) == len(CITIES):
+                print('[debug] Parsed H-1B calendar: ' +
+                      ', '.join(f"{c['city']}={len(c['rows'])} rows" for c in result['cities']),
+                      flush=True)
+                return result
+            last_error = result.get('error', 'missing-city-panels')
 
-        print(
-            f"[debug] Navigation completed in {time.monotonic() - started:.1f}s",
-            flush=True,
-        )
-        print("[debug] HTTP status:", response.status if response else "unknown",
-              flush=True)
-        print("[debug] Page title:", page.title(), flush=True)
+            if not clicked_calendar and time.monotonic() > deadline - 22:
+                # Look for a real calendar link/button in the currently rendered
+                # page, instead of guessing a URL or scraping recent success feeds.
+                links = page.locator('a, button, [role="tab"]')
+                targets = []
+                for i in range(min(links.count(), 200)):
+                    node = links.nth(i)
+                    try:
+                        label = (node.inner_text(timeout=250) or '').strip()
+                    except PWTimeout:
+                        continue
+                    if re.search(r'预约日历|实时日历|可用日期|面签日历', label) and len(label) < 36:
+                        targets.append((node, label))
+                if len(targets) == 1:
+                    try:
+                        targets[0][0].click(timeout=3000)
+                        print(f'[debug] Opened calendar control: {targets[0][1]}', flush=True)
+                    except Exception as exc:
+                        print('[debug] Calendar control not clickable:', type(exc).__name__, flush=True)
+                clicked_calendar = True
+            page.wait_for_timeout(1000)
 
-        stage = "cloudflare_check"
-        body = page.locator("body").inner_text(timeout=10_000)
-
-        if any(marker.lower() in body.lower() for marker in CF_MARKERS):
-            raise RuntimeError("cloudflare")
-
-        stage = "city_grid"
-        started = time.monotonic()
-
-        page.wait_for_function(
-            """() => Array.from(document.querySelectorAll('button'))
-            .some(b => /\\d[\\d,]*\\s*个可用日期/.test(b.textContent))""",
-            timeout=45_000,
-        )
-
-        print(
-            f"[debug] City grid loaded in {time.monotonic() - started:.1f}s",
-            flush=True,
-        )
-
-        stage = "extract"
-        result = page.evaluate(EXTRACT_JS)
-
-        if result.get("error"):
-            print("[debug] Extraction result:", result, flush=True)
-        else:
-            for city in result.get("cities", []):
-                badges = sorted(set(
-                    row["badge"] for row in city.get("rows", [])
-                ))
-                print(
-                    f"[debug] {city['city']}: "
-                    f"{len(city.get('rows', []))} rows; badges={badges}",
-                    flush=True,
-                )
-
-        return result
-
+        # Diagnose without dumping the global recent-bookings feed.
+        result = page.evaluate(EXTRACT_JS, CITIES)
+        present = [c['city'] for c in result.get('cities', [])]
+        missing = [c for c in CITIES if c not in present]
+        print(f'[debug] Calendar unavailable; recognized cities={present}, missing={missing}, '
+              f'reason={result.get("error", last_error)}', flush=True)
+        raise RuntimeError(f'calendar-unavailable ({last_error}; '
+                           f'parsed {len(present)}/{len(CITIES)} cities)')
     except PWTimeout as exc:
-        print(f"[debug] TIMEOUT stage={stage}: {exc}", flush=True)
-
-        try:
-            body = page.locator("body").inner_text(timeout=5_000)
-            print("[debug] Page text:", body[:1500], flush=True)
-
-            if any(marker.lower() in body.lower() for marker in CF_MARKERS):
-                raise RuntimeError("cloudflare")
-
-        except PWTimeout:
-            print("[debug] Could not read page body.", flush=True)
-
-        raise RuntimeError(f"timeout at {stage}")
-
+        raise RuntimeError(f'page-navigation-or-render-timeout ({str(exc).splitlines()[0]})') from exc
 
 
 def scrape(today: dt.date) -> dict:
@@ -306,30 +396,18 @@ EMG_INCLUDE = "include"   # both
 
 
 def _row_wanted(row: dict, city: str = "", emergency: str | None = None) -> bool:
-    """`emergency=None` uses the configured default (VISA_INCLUDE_EMERGENCY);
-    pass EMG_EXCLUDE / EMG_ONLY / EMG_INCLUDE to override for one request.
-
-    The emergency pool is allocated differently from regular slots, so the
-    EMG_ONLY view deliberately filters differently -- see EMERGENCY_TYPES.
-    """
+    """Only H-1B rows; never expand emergency status into F/J categories."""
+    if city and city not in CITIES:
+        return False
+    if row.get('badge', '').upper() != 'H-1B':
+        return False
     mode = emergency or (EMG_INCLUDE if INCLUDE_EMERGENCY else EMG_EXCLUDE)
-    is_emergency = bool(row.get("emergency"))
-
-    if mode == EMG_ONLY:
-        # Emergency slots are pooled: F-1 and J-1 draw on the SAME slots, and the
-        # F-1 sub-categories are not distinguished either. So widen to
-        # EMERGENCY_TYPES and ignore the per-city description narrowing entirely
-        # -- otherwise we would hide slots that are in fact available.
-        return is_emergency and any(row["badge"].startswith(t) for t in EMERGENCY_TYPES)
-
-    if not row["badge"].startswith(VISA_PREFIX):
+    if mode == EMG_ONLY and not row.get('emergency'):
+        return False
+    if mode == EMG_EXCLUDE and row.get('emergency'):
         return False
     desc = _desc_filter(city) if city else DESC_CONTAINS
-    if desc and desc.lower() not in row["desc"].lower():
-        return False
-    if mode == EMG_EXCLUDE and is_emergency:
-        return False   # emergency-only slot, not bookable by regular applicants
-    return True
+    return not desc or desc.lower() in row.get('desc', '').lower()
 
 
 def _short_desc(desc: str) -> str:
@@ -350,6 +428,23 @@ def _cities_index(data: dict) -> dict:
     return {c["city"]: c for c in data.get("cities", [])}
 
 
+def validate_snapshot(data: dict) -> None:
+    """Never send alerts / update dedup state on a missing or partial calendar."""
+    if data.get('error'):
+        raise ValueError(data['error'])
+    idx = _cities_index(data)
+    missing = [c for c in CITIES if c not in idx]
+    if missing:
+        raise ValueError('missing city panels: ' + ', '.join(missing))
+    # A city with 0 *total* available dates may legitimately show no H-1B row.
+    # Otherwise no typed row means we cannot establish the H-1B status.
+    unknown = [c for c in CITIES if not any(_row_wanted(r, c, EMG_INCLUDE)
+                                               for r in idx[c].get('rows', []))
+               and str(idx[c].get('count', '')).replace(',', '') != '0']
+    if unknown:
+        raise ValueError('H-1B listing missing/unknown: ' + ', '.join(unknown))
+
+
 def find_matches(data: dict, today: dt.date, cutoff: dt.date) -> list[dict]:
     """Across the wanted CITIES, return matching rows (>=1 date on/before cutoff)."""
     matches = []
@@ -367,7 +462,7 @@ def find_matches(data: dict, today: dt.date, cutoff: dt.date) -> list[dict]:
                     d = parse_cn_date(chip, today)
                 except ValueError:
                     continue
-                if d <= cutoff:
+                if today <= d <= cutoff:
                     hits.append(d.isoformat())
             if hits:
                 matches.append({"city": city, "badge": row["badge"], "desc": row["desc"],
@@ -445,10 +540,7 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
     cutoff = dt.date.fromisoformat(CUTOFF)
     stamp = dt.datetime.now().isoformat(timespec="seconds")
 
-    if data.get("error"):
-        print(f"[{stamp}] STATUS: EXTRACT_FAILED ({data['error']}) -- "
-              f"no city cards / F-1 rows found (site layout may have changed)", flush=True)
-        return
+    validate_snapshot(data)
 
     idx = _cities_index(data)
     found = [c for c in CITIES if c in idx]
@@ -472,8 +564,11 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
     else:
         age_note = f"; qmq freshest {freshest:.0f}m"
     print(f"[{stamp}] STATUS: OK ({note}{age_note})", flush=True)
+    _, status_body = build_status(data, EMG_EXCLUDE)
+    print(f"[{stamp}] H-1B earliest regular appointments:\n" +
+          "\n".join("    " + x for x in status_body.splitlines()), flush=True)
 
-    matches = find_matches(data, TODAY, cutoff)
+    matches = find_matches(data, current_today(), cutoff)
     # Fingerprint keyed by city+category so alerts are per-city and dedup correctly.
     fp = {f"{m['city']} · {m['desc']}": m["dates"] for m in matches}
 
@@ -495,14 +590,7 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
                 emg = " ⚠emergency-only" if m.get("emergency") else ""
                 print(f"    {m['city']} {m['badge']} ({m['desc']}) [{m['status']}]{emg}: {', '.join(m['dates'])}")
         else:
-            earliest = []
-            for city in CITIES:
-                c = idx.get(city)
-                if not c:
-                    continue
-                firsts = [row["dates"][0] for row in c["rows"] if _row_wanted(row, city) and row["dates"]]
-                earliest.append(f"{city}={min(firsts, key=lambda s: parse_cn_date(s, TODAY)) if firsts else '—'}")
-            print(f"[{stamp}] {target}: no date by {cutoff}. Earliest: {'; '.join(earliest)}")
+            print(f"[{stamp}] {target}: no qualifying date by {cutoff}.", flush=True)
 
     if new_hits:
         # Summarize matching availability per LOCATION: earliest date + count of
@@ -534,7 +622,7 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
     # cannot see new slots at all, so "source is live again" is itself news.
     was_stale = bool(state.get("src_stale"))
     is_stale = freshest is not None and freshest >= STALE_AFTER_MIN
-    if was_stale and not is_stale:
+    if was_stale and freshest is not None and not is_stale:
         push(f"{VISA_PREFIX} source is LIVE again",
              f"qmq data is fresh again (freshest row {freshest:.0f}m old).\n"
              f"Slot monitoring is effective from now on.", priority="high")
@@ -544,7 +632,8 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
              f"qmq has stopped publishing (freshest row {freshest / 60:.1f}h old).\n"
              f"New slots cannot be detected until it recovers.", priority="default")
         print(f"[{stamp}] SOURCE WENT STALE (age {freshest:.0f}m) -- notified", flush=True)
-    state["src_stale"] = is_stale
+    if freshest is not None:
+        state["src_stale"] = is_stale
 
     # Persist current qualifying set so we only alert on genuinely new dates.
     state["last_matches"] = fp
@@ -559,13 +648,11 @@ def check_and_notify(data: dict, verbose: bool = True) -> None:
         for c in data.get("cities", []):
             if c["city"] not in CITIES:
                 continue
-            # Record EVERY visa type, not just the watched one -- otherwise a
-            # later "was there a J-1 slot at time T?" question is unanswerable.
-            # "!" marks an 官方紧急申请 emergency-only row.
+            # Audit only the five configured cities and H-1B listings.
             snapshot[c["city"]] = {
                 f"{r['badge']} {_short_desc(r['desc'])}" + ("!" if r.get("emergency") else ""):
                     r["dates"][:3]
-                for r in c["rows"] if r["dates"]
+                for r in c["rows"] if r["dates"] and _row_wanted(r, c['city'], EMG_INCLUDE)
             }
         line = json.dumps({"t": stamp, "matched": fp, "src_age_min": freshest,
                            "seen": snapshot}, ensure_ascii=False)
@@ -650,17 +737,17 @@ def build_status(data: dict, emergency: str = EMG_EXCLUDE) -> tuple[str, str]:
                 continue
             for chip in row["dates"]:
                 try:
-                    dates.add(parse_cn_date(chip, TODAY))
+                    date = parse_cn_date(chip, current_today())
+                    if date >= current_today():
+                        dates.add(date)
                 except ValueError:
                     continue
             if row["dates"]:
-                # Emergency view spans visa types (F-1/J-1), so name the badge;
-                # otherwise name the sub-category, but only where a city is
-                # broadened (elsewhere it's always the same one).
+                # Keep labels optional; this monitor covers all H-1B subcategories.
                 labels.add(row["badge"] if emergency == EMG_ONLY
                            else _short_desc(row["desc"]) if city in DESC_BY_CITY else "")
         if not dates:
-            lines.append((None, f"{city}: none"))
+            lines.append((None, f"{city}: none shown"))
             continue
         earliest = min(dates)
         named = sorted(x for x in labels if x)
@@ -668,12 +755,11 @@ def build_status(data: dict, emergency: str = EMG_EXCLUDE) -> tuple[str, str]:
         mark = " ✓" if earliest <= cutoff else ""
         plural = "" if len(dates) == 1 else "s"
         lines.append((earliest, f"{city}: {earliest.isoformat()}, {len(dates)} date{plural}{cats}{mark}"))
-    # soonest first; locations with nothing sink to the bottom
-    lines.sort(key=lambda t: (t[0] is None, t[0] or dt.date.max))
+    # Preserve requested city order rather than sorting the five consulates.
     hits = sum(1 for d, _ in lines if d and d <= cutoff)
-    # The emergency view spans the pooled visa types, so name them, not VISA_TYPE.
+    # The emergency view remains H-1B-only in this specialized monitor.
     if emergency == EMG_ONLY:
-        what = f"{'/'.join(EMERGENCY_TYPES)} emergency status (官方紧急申请 only)"
+        what = f"H-1B emergency status (官方紧急申请 only)"
     elif emergency == EMG_INCLUDE:
         what = f"{VISA_PREFIX} status (regular + emergency)"
     else:
@@ -693,18 +779,14 @@ def run_check(emergency: str = EMG_EXCLUDE, page=None) -> int:
     """
     stamp = dt.datetime.now().isoformat(timespec="seconds")
     try:
-        data = render_and_extract(page, TODAY) if page is not None else scrape(TODAY)
+        data = render_and_extract(page, current_today()) if page is not None else scrape(current_today())
+        validate_snapshot(data)
     except Exception as e:
         reason = str(e) or e.__class__.__name__
         print(f"[{stamp}] STATUS: SCRAPE_FAILED ({reason})", flush=True)
         push(f"{VISA_PREFIX} status unavailable", f"Could not read qmq.app: {reason}",
              priority="default")
-        return 0
-    if data.get("error"):
-        print(f"[{stamp}] STATUS: EXTRACT_FAILED ({data['error']})", flush=True)
-        push(f"{VISA_PREFIX} status unavailable", f"Extract failed: {data['error']}",
-             priority="default")
-        return 0
+        return 1
     title, body = build_status(data, emergency)
     print(f"[{stamp}] {title}\n" + "\n".join("    " + b for b in body.split("\n")), flush=True)
     # single, non-urgent push: this is user-requested, not a slot alert. Does not
@@ -715,16 +797,15 @@ def run_check(emergency: str = EMG_EXCLUDE, page=None) -> int:
 
 def run_once() -> int:
     try:
-        data = scrape(TODAY)
+        data = scrape(current_today())
+        validate_snapshot(data)
+        check_and_notify(data)
+        return 0
     except Exception as e:
-        # Soft-fail: keep a scheduled run "green" so we don't spam failure emails
-        # on a transient Cloudflare block / timeout. A persistent block shows in logs.
         stamp = dt.datetime.now().isoformat(timespec="seconds")
         reason = str(e) or e.__class__.__name__
-        print(f"[{stamp}] STATUS: SCRAPE_FAILED ({reason}) -- site unreadable this run", flush=True)
-        return 0
-    check_and_notify(data)
-    return 0
+        print(f"[{stamp}] STATUS: SCRAPE_FAILED ({reason}) -- no valid H-1B data", flush=True)
+        return 1   # red GitHub Actions run: failure should not masquerade as success
 
 
 def in_burst_window(now: dt.datetime) -> bool:
@@ -768,7 +849,9 @@ def run_watch(interval: int, recycle: int = 40) -> int:
                 n += 1
                 started = time.monotonic()
                 try:
-                    check_and_notify(render_and_extract(page, TODAY))
+                    data = render_and_extract(page, current_today())
+                    validate_snapshot(data)
+                    check_and_notify(data)
                 except Exception as e:
                     stamp = dt.datetime.now().isoformat(timespec="seconds")
                     reason = str(e) or e.__class__.__name__
