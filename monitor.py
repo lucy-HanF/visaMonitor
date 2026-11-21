@@ -377,6 +377,124 @@ def _diagnostic_snapshot(page, events: dict) -> None:
             print('[diagnostic] screenshot_failed=' + type(exc).__name__, flush=True)
 
 
+# A November 2026 home page exposes "查看可预约面签位" rather than the old
+# "N 个可用日期" calendar buttons. The previous version did not match it.
+CALENDAR_ENTRY = re.compile(
+    r"(?:查看可预约面签位|查看可用面签位|查看可预约日期|查看可用日期|"
+    r"(?:查看|打开|进入)?(?:预约日历|实时日历|面签日历|可用日期))"
+)
+
+
+def _click_calendar_entry(page) -> str:
+    """Open only a public availability view, never any booking/login control.
+
+    Return an action label for diagnostics. Failure is not treated as success.
+    """
+    # React may mount the public-calendar button after DOMContentLoaded.
+    try:
+        page.get_by_text('查看可预约面签位', exact=True).first.wait_for(
+            state='visible', timeout=6000)
+    except Exception:
+        pass  # Fall back to other labels or report absence.
+    candidates = page.locator('button, a, [role="button"], [role="tab"]')
+    found = []
+    for i in range(min(candidates.count(), 300)):
+        node = candidates.nth(i)
+        try:
+            if not node.is_visible(timeout=200):
+                continue
+            label = ' '.join((node.inner_text(timeout=300) or '').split())
+            if label and len(label) < 50 and CALENDAR_ENTRY.search(label):
+                found.append((label, node))
+        except Exception:
+            continue
+    if not found:
+        print('[debug] Calendar entry: no matching visible control', flush=True)
+        return 'not-found'
+    # Prefer the new observed label over generic calendar links.
+    found.sort(key=lambda p: (p[0] != '查看可预约面签位', len(p[0])))
+    for label, node in found:
+        try:
+            node.click(timeout=4500)
+            print(f'[debug] Calendar entry clicked: {label}', flush=True)
+            return 'clicked:' + label
+        except Exception as exc:
+            print(f'[debug] Calendar entry click failed: {label}, '
+                  f'{type(exc).__name__}', flush=True)
+    return 'not-clickable'
+
+
+def _select_cn_country(page) -> bool:
+    """Best-effort public calendar country selector; do not submit any forms."""
+    # Standard HTML <select> is unambiguous: exactly one China option.
+    try:
+        options = page.evaluate(r'''() => [...document.querySelectorAll('select')].map((el,i) => ({
+          index: i, visible: !!el.getClientRects().length,
+          options: [...el.options].map(o => ({value:o.value, text:o.text.trim()}))
+        }))''')
+        for group in options:
+            if not group['visible']:
+                continue
+            cn = [o for o in group['options'] if o['text'] in
+                  ('中国', '中国大陆', 'China', 'Mainland China', '中国 (CN)') or
+                  o['value'].lower() == 'cn']
+            if len(cn) == 1 and len(group['options']) >= 3:
+                selector = page.locator('select').nth(group['index'])
+                selector.select_option(value=cn[0]['value'], timeout=3500)
+                print('[debug] Calendar country selected: CN (native select)', flush=True)
+                return True
+    except Exception as exc:
+        print(f'[debug] Country native-select skipped: {type(exc).__name__}', flush=True)
+
+    # Try a visible country chooser, but only if this is an obvious calendar control.
+    try:
+        chooser = page.get_by_role('combobox', name=re.compile('国家|地区|country', re.I))
+        if chooser.count():
+            chooser.first.click(timeout=2500)
+        else:
+            chooser = page.locator('button, [role="button"]').filter(
+                has_text=re.compile(r'^\s*(?:选择国家|请选择国家|选择地区|请选择地区|全部国家|Select country)\s*$', re.I))
+            if chooser.count():
+                chooser.first.click(timeout=2500)
+            else:
+                return False
+        page.wait_for_timeout(300)
+        for role in ('option', 'button'):
+            for name in ('中国大陆', '中国', 'China', 'Mainland China'):
+                loc = page.get_by_role(role, name=name, exact=True)
+                if loc.count() and loc.first.is_visible():
+                    loc.first.click(timeout=3000)
+                    print('[debug] Calendar country selected: CN (custom control)', flush=True)
+                    return True
+    except Exception as exc:
+        print(f'[debug] Country chooser not completed: {type(exc).__name__}', flush=True)
+    return False
+
+
+def _calendar_ui_diagnostic(page, stage: str) -> None:
+    """Print control labels only, not complete page or personal booking data."""
+    try:
+        controls = page.evaluate(r'''() => {
+          const clean = v => (v || '').replace(/\s+/g, ' ').trim().slice(0, 70);
+          const visible = el => !!el.getClientRects().length &&
+            getComputedStyle(el).visibility !== 'hidden';
+          const word = /国家|地区|中国|China|city|城市|领馆|签证|H-1B|H1B|日历|面签|日期|country|visa|calendar|available/i;
+          const elements = [...document.querySelectorAll('button, [role="button"], [role="tab"], [role="combobox"], [role="option"]')]
+            .filter(visible).map(el => clean(el.innerText || el.getAttribute('aria-label')))
+            .filter(t => t.length < 70 && word.test(t));
+          const selects = [...document.querySelectorAll('select')].filter(visible)
+            .map(el => ({ label: clean(el.getAttribute('aria-label') || ''),
+              choices: [...el.options].map(o => clean(o.text)).filter(t => word.test(t)).slice(0, 12) }));
+          return { url_path: location.pathname, candidates: [...new Set(elements)].slice(0, 35),
+            selects: selects.slice(0, 8), dialogs: document.querySelectorAll('[role="dialog"]').length };
+        }''')
+        print(f'[diagnostic] calendar_ui_{stage}=' +
+              json.dumps(controls, ensure_ascii=False), flush=True)
+    except Exception as exc:
+        print(f'[diagnostic] calendar_ui_{stage}_failed=' +
+              type(exc).__name__, flush=True)
+
+
 def render_and_extract(page, today: dt.date) -> dict:
     """Find the real availability calendar, never infer dates from homepage news.
 
@@ -424,40 +542,42 @@ def render_and_extract(page, today: dt.date) -> dict:
         if any(x.lower() in body.lower() for x in CF_MARKERS):
             raise RuntimeError('cloudflare')
 
-        # The old grid may now live under a "日历" tab / link. We ONLY click a
-        # link with an explicit calendar label; never click checkout/order/login.
-        clicked_calendar = False
-        deadline = time.monotonic() + 28
+        # Check the page once, then proactively open the observed 2026 calendar
+        # entry. The earlier version never clicked "查看可预约面签位" because the
+        # matching regex omitted that exact label.
+        result = page.evaluate(EXTRACT_JS, CITIES)
+        entry = 'unneeded'
+        if result.get('error') or len(result.get('cities', [])) != len(CITIES):
+            entry = _click_calendar_entry(page)
+            if entry.startswith('clicked:'):
+                page.wait_for_timeout(900)
+                _calendar_ui_diagnostic(page, 'after_entry')
+
+        # The calendar may show country selection before city/visa rows.
+        country_attempts = 0
+        country_selected = False
+        next_country_attempt = 0.0
+        deadline = time.monotonic() + 24
         last_error = 'city-calendar-not-found'
         while time.monotonic() < deadline:
             result = page.evaluate(EXTRACT_JS, CITIES)
             if not result.get('error') and len(result.get('cities', [])) == len(CITIES):
+                validate_snapshot(result)
                 print('[debug] Parsed H-1B calendar: ' +
                       ', '.join(f"{c['city']}={len(c['rows'])} rows" for c in result['cities']),
                       flush=True)
                 return result
             last_error = result.get('error', 'missing-city-panels')
 
-            if not clicked_calendar and time.monotonic() > deadline - 22:
-                # Look for a real calendar link/button in the currently rendered
-                # page, instead of guessing a URL or scraping recent success feeds.
-                links = page.locator('a, button, [role="tab"]')
-                targets = []
-                for i in range(min(links.count(), 200)):
-                    node = links.nth(i)
-                    try:
-                        label = (node.inner_text(timeout=250) or '').strip()
-                    except PWTimeout:
-                        continue
-                    if re.search(r'预约日历|实时日历|可用日期|面签日历', label) and len(label) < 36:
-                        targets.append((node, label))
-                if len(targets) == 1:
-                    try:
-                        targets[0][0].click(timeout=3000)
-                        print(f'[debug] Opened calendar control: {targets[0][1]}', flush=True)
-                    except Exception as exc:
-                        print('[debug] Calendar control not clickable:', type(exc).__name__, flush=True)
-                clicked_calendar = True
+            # Country controls may mount asynchronously after the entry click.
+            if (entry.startswith('clicked:') and not country_selected
+                    and country_attempts < 5 and time.monotonic() >= next_country_attempt):
+                country_attempts += 1
+                country_selected = _select_cn_country(page)
+                next_country_attempt = time.monotonic() + 3
+                if country_selected:
+                    page.wait_for_timeout(1000)
+                    _calendar_ui_diagnostic(page, 'after_country')
             page.wait_for_timeout(1000)
 
         # Diagnose without dumping the global recent-bookings feed.
@@ -466,6 +586,8 @@ def render_and_extract(page, today: dt.date) -> dict:
         missing = [c for c in CITIES if c not in present]
         print(f'[debug] Calendar unavailable; recognized cities={present}, missing={missing}, '
               f'reason={result.get("error", last_error)}', flush=True)
+        print(f'[debug] Calendar entry action={entry}; country_selection_attempts={country_attempts}; country_selected={country_selected}', flush=True)
+        _calendar_ui_diagnostic(page, 'on_failure')
         _diagnostic_snapshot(page, events)
         raise RuntimeError(f'calendar-unavailable ({last_error}; '
                            f'parsed {len(present)}/{len(CITIES)} cities)')
