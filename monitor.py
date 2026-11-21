@@ -220,7 +220,9 @@ def render_and_extract(page, today: dt.date) -> dict:
             timeout=45_000,
         )
         page.wait_for_function(
-            "() => document.body.innerText.includes('F-1')", timeout=20_000
+            "prefix => document.body.innerText.includes(prefix)",
+            arg=VISA_PREFIX,
+            timeout=20_000,
         )
         return page.evaluate(EXTRACT_JS)
     except PWTimeout:
