@@ -70,7 +70,7 @@ NTFY_SERVER = os.getenv(
 NTFY_TOKEN = os.getenv("VISA_NTFY_TOKEN", "").strip()
 
 PUSH_REPEAT = max(
-    1, int(os.getenv("VISA_PUSH_REPEAT", "3"))
+    1, int(os.getenv("VISA_PUSH_REPEAT") or "3")
 )
 
 PUSH_INTERVAL = max(
