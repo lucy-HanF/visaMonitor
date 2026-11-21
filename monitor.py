@@ -200,38 +200,84 @@ def _new_page(browser):
     return ctx.new_page()
 
 
-def render_and_extract(page, today: dt.date) -> dict:
-    """(Re)load qmq.app on an existing page and return the extracted city rows.
 
-    Raises RuntimeError('cloudflare') on a Cloudflare challenge/rate limit,
-    and RuntimeError('timeout') if the grid never renders. Reusable across many
-    reloads (watch mode) so we keep one browser process open.
-    """
+def render_and_extract(page, today: dt.date) -> dict:
+    """Load qmq.app, wait for its city grid, and extract visible data."""
     from playwright.sync_api import TimeoutError as PWTimeout
+
+    stage = "navigation"
+
     try:
-        page.goto(URL, wait_until="domcontentloaded", timeout=60_000)
-        print("[debug] URL:", page.url, flush=True)
-        print("[debug] TITLE:", page.title(), flush=True)
-        print("[debug] BODY:", page.locator("body").inner_text()[:1500], flush=True)
-        head = (page.content()[:4000] if page.content() else "")
-        if any(m in head for m in CF_MARKERS):
+        started = time.monotonic()
+        print("[debug] Opening:", URL, flush=True)
+
+        response = page.goto(
+            URL,
+            wait_until="domcontentloaded",
+            timeout=60_000,
+        )
+
+        print(
+            f"[debug] Navigation completed in {time.monotonic() - started:.1f}s",
+            flush=True,
+        )
+        print("[debug] HTTP status:", response.status if response else "unknown",
+              flush=True)
+        print("[debug] Page title:", page.title(), flush=True)
+
+        stage = "cloudflare_check"
+        body = page.locator("body").inner_text(timeout=10_000)
+
+        if any(marker.lower() in body.lower() for marker in CF_MARKERS):
             raise RuntimeError("cloudflare")
-        # Wait for the grid to populate: a city card shows its date count.
+
+        stage = "city_grid"
+        started = time.monotonic()
+
         page.wait_for_function(
-            "() => Array.from(document.querySelectorAll('button'))"
-            ".some(b => /\\d[\\d,]*\\s*个可用日期/.test(b.textContent))",
+            """() => Array.from(document.querySelectorAll('button'))
+            .some(b => /\\d[\\d,]*\\s*个可用日期/.test(b.textContent))""",
             timeout=45_000,
         )
-        page.wait_for_function(
-            "() => document.body.innerText.includes('H-1B')",
-            timeout=20_000
+
+        print(
+            f"[debug] City grid loaded in {time.monotonic() - started:.1f}s",
+            flush=True,
         )
-        return page.evaluate(EXTRACT_JS)
-    except PWTimeout:
-        body = (page.content()[:4000] if page.content() else "")
-        if any(m in body for m in CF_MARKERS):
-            raise RuntimeError("cloudflare")
-        raise RuntimeError("timeout")
+
+        stage = "extract"
+        result = page.evaluate(EXTRACT_JS)
+
+        if result.get("error"):
+            print("[debug] Extraction result:", result, flush=True)
+        else:
+            for city in result.get("cities", []):
+                badges = sorted(set(
+                    row["badge"] for row in city.get("rows", [])
+                ))
+                print(
+                    f"[debug] {city['city']}: "
+                    f"{len(city.get('rows', []))} rows; badges={badges}",
+                    flush=True,
+                )
+
+        return result
+
+    except PWTimeout as exc:
+        print(f"[debug] TIMEOUT stage={stage}: {exc}", flush=True)
+
+        try:
+            body = page.locator("body").inner_text(timeout=5_000)
+            print("[debug] Page text:", body[:1500], flush=True)
+
+            if any(marker.lower() in body.lower() for marker in CF_MARKERS):
+                raise RuntimeError("cloudflare")
+
+        except PWTimeout:
+            print("[debug] Could not read page body.", flush=True)
+
+        raise RuntimeError(f"timeout at {stage}")
+
 
 
 def scrape(today: dt.date) -> dict:
